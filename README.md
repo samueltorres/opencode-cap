@@ -33,8 +33,21 @@ For a local checkout, use its path as `package`, for example `"/path/to/opencode
 | ------- | ------- | ------------------------------------------------------------------------------------------------- |
 | `limit` | none    | Maximum spend in USD for a session and its subagents combined. Without it, spend is only tracked. |
 | `warn`  | `0.8`   | Fraction of `limit` at which the session gets a warning, or `false` to disable warnings.          |
+| `report` | none   | File that gets one JSON line with the session's total cost each time its execution ends.          |
 
 Unknown or invalid options stop the plugin from loading, and the error names the problem.
+
+## Cost report
+
+Set `report` to a file path and the plugin appends one JSON line each time a root session's execution succeeds, fails or
+is interrupted. It is written whether or not a limit is set or hit, so you always know what a run cost:
+
+```json
+{"time":"2026-10-21T10:00:00.000Z","sessionID":"ses_1","status":"succeeded","cost":0.75,"limit":10,"exceeded":false,"sessions":{"ses_1":0.5,"ses_2":0.25}}
+```
+
+`cost` is the total in USD across the session and its subagents; `sessions` breaks it down. Each execution adds a line
+with the running total, so the last line for a session is its final cost.
 
 ## Headless runs
 

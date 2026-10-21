@@ -1,3 +1,5 @@
+import { appendFile, mkdir } from "node:fs/promises"
+import { dirname } from "node:path"
 import { Plugin } from "@opencode/plugin"
 import { assess, formatUSD, Ledger } from "./src/ledger.js"
 import { parseAmount, parseOptions } from "./src/options.js"
@@ -111,6 +113,25 @@ export default Plugin.define({
       `Budget exceeded: ${spent(rootID)}, over the ${formatUSD(limit)} limit, so opencode-cap stopped it. ` +
       `Run /budget <amount> to raise this session's limit.`
 
+    /** Appends the root session's total cost to the report file, whether or not a limit was hit. */
+    const report = async (sessionID: string, status: string) => {
+      if (options.report === undefined) return
+      await ensure(sessionID)
+      if (ledger.root(sessionID) !== sessionID) return
+      const budget = budgets.get(sessionID)
+      const record = {
+        time: new Date().toISOString(),
+        sessionID,
+        status,
+        cost: ledger.total(sessionID),
+        limit: budget?.limit ?? null,
+        exceeded: budget?.exceeded ?? false,
+        sessions: Object.fromEntries(ledger.tree(sessionID).map((id) => [id, ledger.cost(id)])),
+      }
+      await mkdir(dirname(options.report), { recursive: true })
+      await appendFile(options.report, `${JSON.stringify(record)}\n`)
+    }
+
     /** Checks a session tree's spend; `started` marks a new execution that must not run over budget. */
     const enforce = async (sessionID: string, started: boolean) => {
       await ensure(sessionID)
@@ -198,6 +219,15 @@ export default Plugin.define({
         }
         case "session.execution.started":
           await enforce(event.data.sessionID, true)
+          return
+        case "session.execution.succeeded":
+          await report(event.data.sessionID, "succeeded")
+          return
+        case "session.execution.failed":
+          await report(event.data.sessionID, "failed")
+          return
+        case "session.execution.interrupted":
+          await report(event.data.sessionID, "interrupted")
           return
         case "session.deleted": {
           const { sessionID } = event.data

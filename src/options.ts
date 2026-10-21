@@ -5,9 +5,11 @@ export interface Options {
   readonly limit?: number
   /** Fraction of the limit at which the session is warned, or `false` to disable warnings. */
   readonly warn: number | false
+  /** File that receives one JSON line with the session's total cost each time its execution ends. */
+  readonly report?: string
 }
 
-const KEYS = new Set(["limit", "warn"])
+const KEYS = new Set(["limit", "warn", "report"])
 
 export function parseOptions(input: PluginOptions): Options {
   const unknown = Object.keys(input).filter((key) => !KEYS.has(key))
@@ -21,7 +23,11 @@ export function parseOptions(input: PluginOptions): Options {
   if (warn !== false && !(isPositive(warn) && warn < 1))
     throw new Error(`opencode-cap: "warn" must be a fraction between 0 and 1, or false, got ${JSON.stringify(warn)}`)
 
-  return { limit, warn }
+  const report = typeof input.report === "string" && input.report.trim() !== "" ? input.report.trim() : undefined
+  if (input.report !== undefined && typeof input.report !== "string")
+    throw new Error(`opencode-cap: "report" must be a file path, got ${JSON.stringify(input.report)}`)
+
+  return { limit, warn, report }
 }
 
 export function parseAmount(text: string): number | undefined {

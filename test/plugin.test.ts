@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { mkdtemp, readFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import type { Plugin } from "@opencode/plugin"
 import plugin from "../index"
 
@@ -110,6 +113,30 @@ afterEach(() => {
 })
 
 describe("opencode-cap", () => {
+  test("reports the total cost when the root execution ends, even under budget", async () => {
+    const file = join(await mkdtemp(join(tmpdir(), "cap-")), "nested", "usage.jsonl")
+    const oc = host()
+    await oc.load({ limit: 10, report: file })
+    await oc.created("root")
+    await oc.created("sub", "root")
+    await oc.usage("root", 0.5)
+    await oc.usage("sub", 0.25)
+
+    await oc.emit("session.execution.succeeded", { sessionID: "sub" })
+    await oc.emit("session.execution.succeeded", { sessionID: "root" })
+
+    const lines = (await readFile(file, "utf8")).trim().split("\n").map((line) => JSON.parse(line))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatchObject({
+      sessionID: "root",
+      status: "succeeded",
+      cost: 0.75,
+      limit: 10,
+      exceeded: false,
+      sessions: { root: 0.5, sub: 0.25 },
+    })
+  })
+
   test("stops the whole session tree once combined spend exceeds the limit", async () => {
     const oc = host()
     await oc.load({ limit: 1 })
