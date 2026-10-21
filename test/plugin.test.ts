@@ -10,6 +10,10 @@ function host(sessions: Record<string, { parentID?: string; cost: number }> = {}
   const queue: { event: unknown; done: () => void }[] = []
   let wake: (() => void) | undefined
   const interrupted: string[] = []
+  // Sessions whose interrupt fails, e.g. a transient host error.
+  const failing = new Set<string>()
+  let subscriptions = 0
+  let disconnecting = false
   const notes: { sessionID: string; text: string; resume?: boolean }[] = []
   const commands: Command[] = []
 
@@ -17,8 +21,13 @@ function host(sessions: Record<string, { parentID?: string; cost: number }> = {}
     options: {},
     event: {
       async *subscribe({ signal }: { signal: AbortSignal }) {
+        subscriptions++
         while (!signal.aborted) {
           if (queue.length === 0) await new Promise<void>((resolve) => (wake = resolve))
+          if (disconnecting) {
+            disconnecting = false
+            return
+          }
           const next = queue.shift()
           if (!next) continue
           yield next.event
@@ -34,6 +43,7 @@ function host(sessions: Record<string, { parentID?: string; cost: number }> = {}
         return { id: sessionID, ...session }
       },
       interrupt: async ({ sessionID }: { sessionID: string }) => {
+        if (failing.has(sessionID)) throw new Error(`Interrupt failed: ${sessionID}`)
         interrupted.push(sessionID)
         return true
       },
@@ -64,8 +74,16 @@ function host(sessions: Record<string, { parentID?: string; cost: number }> = {}
     sessions,
     storage,
     interrupted,
+    failing,
     notes,
     emit,
+    /** Ends the current event subscription and resolves once the plugin has subscribed again. */
+    async reconnect() {
+      const before = subscriptions
+      disconnecting = true
+      wake?.()
+      while (subscriptions === before) await Bun.sleep(25)
+    },
     created: (sessionID: string, parentID?: string) => {
       sessions[sessionID] = { parentID, cost: 0 }
       return emit("session.created", { sessionID, parentID })
@@ -130,8 +148,10 @@ describe("opencode-cap", () => {
     await oc.usage("root", 2)
     oc.interrupted.length = 0
 
+    // Spend recorded after the stop, e.g. a billed in-flight step, stops the session again.
     await oc.usage("root", 2.1)
-    expect(oc.interrupted).toEqual([])
+    expect(oc.interrupted).toEqual(["root"])
+    oc.interrupted.length = 0
 
     await oc.started("root")
     expect(oc.interrupted).toEqual(["root"])
@@ -187,7 +207,10 @@ describe("opencode-cap", () => {
     await before.created("sub", "root")
     await before.created("nested", "sub")
     await before.budget("root", "3")
-    expect(before.storage.get("tree/root")).toEqual({ sub: "root", nested: "sub" })
+    expect(before.storage.get("tree/root")).toEqual({
+      sub: { parentID: "root", cost: 0 },
+      nested: { parentID: "sub", cost: 0 },
+    })
 
     const sessions = { root: { cost: 1 }, sub: { parentID: "root", cost: 1 }, nested: { parentID: "sub", cost: 0.5 } }
     const after = host(sessions, before.storage)
@@ -204,7 +227,7 @@ describe("opencode-cap", () => {
     await oc.load({ limit: 1, warn: false })
     await oc.usage("sub", 0.7)
     expect(oc.interrupted.sort()).toEqual(["root", "sub"])
-    expect(oc.storage.get("tree/root")).toEqual({ sub: "root" })
+    expect(oc.storage.get("tree/root")).toEqual({ sub: { parentID: "root", cost: 0.7 } })
   })
 
   test("forgets a root session and its stored state when it is deleted", async () => {
@@ -215,6 +238,73 @@ describe("opencode-cap", () => {
     await oc.budget("root", "2")
     await oc.emit("session.deleted", { sessionID: "root" })
     expect([...oc.storage.keys()]).toEqual([])
+  })
+
+  test("keeps a deleted subagent's spend after a restart", async () => {
+    const before = host()
+    await before.load({ limit: 1, warn: false })
+    await before.created("root")
+    await before.created("sub", "root")
+    await before.usage("sub", 0.8)
+    await before.emit("session.deleted", { sessionID: "sub" })
+
+    const after = host({ root: { cost: 0 } }, before.storage)
+    await after.load({ limit: 1, warn: false })
+    await after.usage("root", 0.3)
+    expect(after.interrupted.sort()).toEqual(["root", "sub"])
+  })
+
+  test("restores subagents regardless of stored order", async () => {
+    const storage = new Map<string, unknown>([
+      ["tree/root", { nested: { parentID: "sub", cost: 0.5 }, sub: { parentID: "root", cost: 0.4 } }],
+    ])
+    const oc = host({ root: { cost: 0 } }, storage)
+    await oc.load({ limit: 1, warn: false })
+    await oc.usage("root", 0.2)
+    expect(oc.interrupted.sort()).toEqual(["nested", "root", "sub"])
+  })
+
+  test("never shows a partially restored tree", async () => {
+    const storage = new Map<string, unknown>([["tree/root", { sub: { parentID: "root", cost: 0.6 } }]])
+    const oc = host({ root: { cost: 0.2 } }, storage)
+    await oc.load({})
+    await Promise.all([oc.started("root"), oc.budget("root")])
+    expect(oc.notes.at(-1)!.text).toBe("Budget: this session and its 1 subagent spent $0.80. No limit is set.")
+  })
+
+  test("interrupts again a session that keeps spending after a failed stop", async () => {
+    const oc = host()
+    await oc.load({ limit: 1, warn: false })
+    await oc.created("root")
+    await oc.created("sub", "root")
+    oc.failing.add("sub")
+    await oc.usage("sub", 1.5)
+    expect(oc.interrupted).toEqual(["root"])
+
+    oc.failing.clear()
+    await oc.usage("sub", 1.7)
+    expect(oc.interrupted).toEqual(["root", "sub"])
+    expect(oc.notes.filter((note) => note.text.startsWith("Budget exceeded"))).toHaveLength(1)
+  })
+
+  test("resubscribes when the event stream ends", async () => {
+    const oc = host()
+    await oc.load({ limit: 1, warn: false })
+    await oc.created("root")
+    await oc.reconnect()
+    await oc.usage("root", 2)
+    expect(oc.interrupted).toEqual(["root"])
+  })
+
+  test("clears stored state of a deleted root that was never loaded", async () => {
+    const storage = new Map<string, unknown>([
+      ["limit/root", 5],
+      ["tree/root", { sub: { parentID: "root", cost: 1 } }],
+    ])
+    const oc = host({}, storage)
+    await oc.load({})
+    await oc.emit("session.deleted", { sessionID: "root" })
+    expect([...storage.keys()]).toEqual([])
   })
 
   test("keeps handling events after a failure", async () => {

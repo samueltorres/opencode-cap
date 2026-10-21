@@ -2,11 +2,19 @@ import { Plugin } from "@opencode/plugin"
 import { assess, formatUSD, Ledger } from "./src/ledger.js"
 import { parseAmount, parseOptions } from "./src/options.js"
 
+type Context = Parameters<Plugin.Plugin["setup"]>[0]
+type Event = ReturnType<Context["event"]["subscribe"]> extends AsyncIterable<infer E> ? E : never
+
 interface Budget {
   limit?: number
   warned: boolean
   exceeded: boolean
 }
+
+/** A subagent as persisted in `tree/<rootID>`. */
+type StoredChild = { parentID: string; cost: number }
+
+const RESUBSCRIBE_DELAY_MS = 1_000
 
 export default Plugin.define({
   id: "opencode-cap",
@@ -17,21 +25,25 @@ export default Plugin.define({
     const budgets = new Map<string, Budget>()
     const loading = new Map<string, Promise<void>>()
     // Persisted per root session so they survive restarts: the limit set with /budget, and the
-    // subagent tree as { childID: parentID } so earlier subagent spend is still counted.
+    // subagent tree with each subagent's last known cost, so its spend still counts once deleted.
     const limitKey = (rootID: string) => `limit/${rootID}`
     const treeKey = (rootID: string) => `tree/${rootID}`
 
-    const addRoot = (sessionID: string, cost: number, limit = options.limit) => {
-      ledger.track(sessionID, undefined, cost)
-      budgets.set(sessionID, { limit, warned: false, exceeded: false })
-    }
+    const saveTree = (rootID: string) =>
+      ctx.storage.set(
+        treeKey(rootID),
+        Object.fromEntries(
+          ledger
+            .tree(rootID)
+            .slice(1)
+            .map((id) => [id, { parentID: ledger.parent(id) ?? rootID, cost: ledger.cost(id) }]),
+        ),
+      )
 
     const addChild = async (sessionID: string, parentID: string, cost = 0) => {
       if (ledger.has(sessionID)) return
       ledger.track(sessionID, parentID, cost)
-      const rootID = ledger.root(sessionID)
-      const tree = ledger.tree(rootID).slice(1)
-      await ctx.storage.set(treeKey(rootID), Object.fromEntries(tree.map((id) => [id, ledger.parent(id) ?? rootID])))
+      await saveTree(ledger.root(sessionID))
     }
 
     // Loads a session the plugin has not seen yet, e.g. one created before OpenCode restarted.
@@ -56,21 +68,31 @@ export default Plugin.define({
         ctx.storage.get(limitKey(sessionID)),
         ctx.storage.get(treeKey(sessionID)),
       ])
-      addRoot(sessionID, session.cost, typeof limit === "number" ? limit : undefined)
-      if (typeof tree !== "object" || tree === null || Array.isArray(tree)) return
-      // Entries are in creation order, so parents are tracked before their children.
-      const children = Object.entries(tree).filter((entry): entry is [string, string] => typeof entry[1] === "string")
-      const costs = await Promise.all(
-        children.map(([childID]) =>
-          ctx.session.get({ sessionID: childID }).then(
-            (child) => child.cost,
-            () => 0,
-          ),
-        ),
+      const stored = Object.entries(typeof tree === "object" && tree !== null ? tree : {}).filter(
+        (entry): entry is [string, StoredChild] => isStoredChild(entry[1]),
       )
-      children.forEach(([childID, parentID], index) => {
-        if (ledger.has(parentID)) ledger.track(childID, parentID, costs[index])
-      })
+      // Prefer the live cost; a deleted or unreadable subagent keeps its last known spend.
+      const children = await Promise.all(
+        stored.map(async ([childID, child]) => {
+          const live = await ctx.session.get({ sessionID: childID }).then(
+            (info) => info.cost,
+            () => 0,
+          )
+          return [childID, { ...child, cost: Math.max(live, child.cost) }] as const
+        }),
+      )
+
+      // Track the root and its subagents together, so callers never see a partially loaded tree.
+      ledger.track(sessionID, undefined, session.cost)
+      budgets.set(sessionID, { limit: typeof limit === "number" ? limit : options.limit, warned: false, exceeded: false })
+      // Place children whose parent is tracked until no more fit, independent of storage key order.
+      let remaining = children
+      for (;;) {
+        const placeable = remaining.filter(([, child]) => ledger.has(child.parentID))
+        if (placeable.length === 0) break
+        placeable.forEach(([childID, child]) => ledger.track(childID, child.parentID, child.cost))
+        remaining = remaining.filter(([childID]) => !ledger.has(childID))
+      }
     }
 
     const note = (sessionID: string, text: string) =>
@@ -98,15 +120,13 @@ export default Plugin.define({
 
       const verdict = assess(ledger.total(rootID), budget.limit, options.warn)
       if (verdict === "exceeded") {
-        if (!budget.exceeded) {
-          budget.exceeded = true
-          // Interrupt every session: background subagents keep running when their parent stops.
-          await stop(ledger.tree(rootID))
-          await note(rootID, exceededMessage(rootID, budget.limit))
-        } else if (started) {
-          await stop([sessionID])
-          await note(rootID, exceededMessage(rootID, budget.limit))
-        }
+        const first = !budget.exceeded
+        budget.exceeded = true
+        // First interrupt every session: background subagents keep running when their parent stops.
+        // After that, any session that still spends or starts is interrupted again, which also
+        // retries an interrupt that failed. Interrupting an idle session is a no-op.
+        await stop(first ? ledger.tree(rootID) : [sessionID])
+        if (first || started) await note(rootID, exceededMessage(rootID, budget.limit))
         return
       }
       budget.exceeded = false
@@ -153,47 +173,68 @@ export default Plugin.define({
       })
     })
 
-    const controller = new AbortController()
-    void (async () => {
-      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-        try {
-          switch (event.type) {
-            case "session.created": {
-              const { sessionID, parentID } = event.data
-              if (parentID === undefined) {
-                if (!ledger.has(sessionID)) addRoot(sessionID, 0)
-                break
-              }
-              await ensure(parentID)
-              await addChild(sessionID, parentID)
-              break
+    const handle = async (event: Event) => {
+      switch (event.type) {
+        case "session.created": {
+          const { sessionID, parentID } = event.data
+          if (parentID === undefined) {
+            if (!ledger.has(sessionID)) {
+              ledger.track(sessionID)
+              budgets.set(sessionID, { limit: options.limit, warned: false, exceeded: false })
             }
-            case "session.usage.updated":
-              await ensure(event.data.sessionID)
-              ledger.setCost(event.data.sessionID, event.data.cost)
-              await enforce(event.data.sessionID, false)
-              break
-            case "session.execution.started":
-              await enforce(event.data.sessionID, true)
-              break
-            case "session.deleted": {
-              const { sessionID } = event.data
-              // A deleted subagent's spend still counts against its root.
-              if (!ledger.has(sessionID) || ledger.root(sessionID) !== sessionID) break
-              ledger.forget(sessionID)
-              budgets.delete(sessionID)
-              await Promise.all([ctx.storage.remove(limitKey(sessionID)), ctx.storage.remove(treeKey(sessionID))])
-              break
-            }
+            return
           }
-        } catch (error) {
-          console.error(`opencode-cap: failed to handle ${event.type}`, error)
+          await ensure(parentID)
+          await addChild(sessionID, parentID)
+          return
+        }
+        case "session.usage.updated": {
+          const { sessionID, cost } = event.data
+          await ensure(sessionID)
+          ledger.setCost(sessionID, cost)
+          if (ledger.parent(sessionID) !== undefined) await saveTree(ledger.root(sessionID))
+          await enforce(sessionID, false)
+          return
+        }
+        case "session.execution.started":
+          await enforce(event.data.sessionID, true)
+          return
+        case "session.deleted": {
+          const { sessionID } = event.data
+          // A deleted subagent's spend still counts against its root.
+          if (ledger.has(sessionID) && ledger.root(sessionID) !== sessionID) return
+          // Roots are cleaned up even when never loaded since a restart.
+          ledger.forget(sessionID)
+          budgets.delete(sessionID)
+          await Promise.all([ctx.storage.remove(limitKey(sessionID)), ctx.storage.remove(treeKey(sessionID))])
+          return
         }
       }
-    })().catch((error) => {
-      if (!controller.signal.aborted) console.error("opencode-cap: event subscription ended", error)
-    })
+    }
+
+    const controller = new AbortController()
+    const { signal } = controller
+    // Resubscribes if the stream ends or fails while loaded. Usage events carry cumulative costs and
+    // unknown sessions are loaded on sight, so spend from any missed events is caught up later.
+    void (async () => {
+      while (!signal.aborted) {
+        try {
+          for await (const event of ctx.event.subscribe({ signal })) {
+            await handle(event).catch((error) => console.error(`opencode-cap: failed to handle ${event.type}`, error))
+          }
+        } catch (error) {
+          if (!signal.aborted) console.error("opencode-cap: event subscription failed", error)
+        }
+        if (!signal.aborted) await new Promise((resolve) => setTimeout(resolve, RESUBSCRIBE_DELAY_MS))
+      }
+    })()
 
     return () => controller.abort()
   },
 })
+
+function isStoredChild(value: unknown): value is StoredChild {
+  if (typeof value !== "object" || value === null) return false
+  const { parentID, cost } = value as Record<string, unknown>
+  return typeof parentID === "string" && typeof cost === "number" && Number.isFinite(cost)
+}

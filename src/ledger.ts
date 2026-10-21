@@ -29,6 +29,10 @@ export class Ledger {
     if (session) session.cost = cost
   }
 
+  cost(sessionID: string): number {
+    return this.#sessions.get(sessionID)?.cost ?? 0
+  }
+
   parent(sessionID: string): string | undefined {
     return this.#sessions.get(sessionID)?.parentID
   }
