@@ -1,0 +1,33 @@
+{
+  "name": "opencode-cap",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that stops a session and its subagents when their combined spend exceeds a limit",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "budget",
+    "cost"
+  ],
+  "license": "MIT",
+  "author": "Samuel Torres",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.31"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.31",
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2"
+  }
+}
