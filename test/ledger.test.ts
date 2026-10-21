@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { assess, formatUSD, Ledger } from "../src/ledger"
+import { assess, countTokens, formatTokens, formatUSD, Ledger } from "../src/ledger"
 
 describe("Ledger", () => {
   const build = () => {
@@ -27,10 +27,13 @@ describe("Ledger", () => {
     expect(build().tree("root")).toEqual(["root", "a", "a1", "b"])
   })
 
-  test("replaces a session's cost with the latest cumulative figure", () => {
+  test("replaces a session's usage with the latest cumulative figures", () => {
     const ledger = build()
-    ledger.setCost("a1", 10)
+    ledger.setUsage("a1", 10, 500)
+    ledger.setUsage("b", 3, 200)
     expect(ledger.total("root")).toBe(16)
+    expect(ledger.totalTokens("root")).toBe(700)
+    expect(ledger.totalTokens("a")).toBe(500)
   })
 
   test("does not re-track a known session", () => {
@@ -63,6 +66,15 @@ describe("assess", () => {
     expect(assess(4, 5, 0.8)).toBe("warn")
     expect(assess(6, 5, 0.8)).toBe("exceeded")
   })
+})
+
+test("counts every kind of token, as OpenCode does", () => {
+  expect(countTokens({ input: 1, output: 2, reasoning: 3, cache: { read: 4, write: 5 } })).toBe(15)
+})
+
+test("formatTokens groups thousands", () => {
+  expect(formatTokens(0)).toBe("0")
+  expect(formatTokens(1234567)).toBe("1,234,567")
 })
 
 test("formatUSD shows cents, or more precision for tiny amounts", () => {

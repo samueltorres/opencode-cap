@@ -1,36 +1,42 @@
 /**
- * Cost accounting for session trees.
+ * Cost and token accounting for session trees.
  *
- * OpenCode reports each session's own running cost; a subagent's spend is recorded on its
+ * OpenCode reports each session's own running cost and tokens; a subagent's spend is recorded on its
  * child session, not on the parent. The ledger links sessions to their parents so spend can
  * be summed per root session, which is what a user experiences as "one session".
  */
 export class Ledger {
-  readonly #sessions = new Map<string, { parentID?: string; cost: number; children: Set<string> }>()
+  readonly #sessions = new Map<string, { parentID?: string; cost: number; tokens: number; children: Set<string> }>()
 
   has(sessionID: string): boolean {
     return this.#sessions.has(sessionID)
   }
 
   /** Records a session under its parent. The parent must already be tracked. */
-  track(sessionID: string, parentID?: string, cost = 0): void {
+  track(sessionID: string, parentID?: string, cost = 0, tokens = 0): void {
     if (this.#sessions.has(sessionID)) return
     if (parentID !== undefined) {
       const parent = this.#sessions.get(parentID)
       if (!parent) throw new Error(`Parent session ${parentID} is not tracked`)
       parent.children.add(sessionID)
     }
-    this.#sessions.set(sessionID, { parentID, cost, children: new Set() })
+    this.#sessions.set(sessionID, { parentID, cost, tokens, children: new Set() })
   }
 
-  /** Sets a session's cumulative cost, as reported by `session.usage.updated`. */
-  setCost(sessionID: string, cost: number): void {
+  /** Sets a session's cumulative cost and tokens, as reported by `session.usage.updated`. */
+  setUsage(sessionID: string, cost: number, tokens: number): void {
     const session = this.#sessions.get(sessionID)
-    if (session) session.cost = cost
+    if (!session) return
+    session.cost = cost
+    session.tokens = tokens
   }
 
   cost(sessionID: string): number {
     return this.#sessions.get(sessionID)?.cost ?? 0
+  }
+
+  tokens(sessionID: string): number {
+    return this.#sessions.get(sessionID)?.tokens ?? 0
   }
 
   parent(sessionID: string): string | undefined {
@@ -60,7 +66,11 @@ export class Ledger {
   }
 
   total(sessionID: string): number {
-    return this.tree(sessionID).reduce((sum, id) => sum + (this.#sessions.get(id)?.cost ?? 0), 0)
+    return this.tree(sessionID).reduce((sum, id) => sum + this.cost(id), 0)
+  }
+
+  totalTokens(sessionID: string): number {
+    return this.tree(sessionID).reduce((sum, id) => sum + this.tokens(id), 0)
   }
 
   /** Drops a session and its descendants. */
@@ -83,4 +93,21 @@ export function assess(total: number, limit: number, warn: number | false): Verd
 
 export function formatUSD(amount: number): string {
   return `$${amount.toFixed(amount !== 0 && Math.abs(amount) < 0.01 ? 4 : 2)}`
+}
+
+export function formatTokens(count: number): string {
+  return count.toLocaleString("en-US")
+}
+
+/** Token usage as OpenCode reports it on sessions and `session.usage.updated`. */
+export interface TokenUsage {
+  readonly input: number
+  readonly output: number
+  readonly reasoning: number
+  readonly cache: { readonly read: number; readonly write: number }
+}
+
+/** All tokens a session processed, including cached ones, matching OpenCode's own total. */
+export function countTokens(usage: TokenUsage): number {
+  return usage.input + usage.output + usage.reasoning + usage.cache.read + usage.cache.write
 }

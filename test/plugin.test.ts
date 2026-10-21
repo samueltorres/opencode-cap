@@ -9,7 +9,10 @@ type Context = Parameters<Plugin.Plugin["setup"]>[0]
 type Command = { name: string; execute: (input: { sessionID: string; prompt: { text: string } }) => Promise<void> }
 
 /** A fake OpenCode host: an event stream, a session store, and plugin storage. */
-function host(sessions: Record<string, { parentID?: string; cost: number }> = {}, storage = new Map<string, unknown>()) {
+function host(
+  sessions: Record<string, { parentID?: string; cost: number; tokens?: number }> = {},
+  storage = new Map<string, unknown>(),
+) {
   const queue: { event: unknown; done: () => void }[] = []
   let wake: (() => void) | undefined
   const interrupted: string[] = []
@@ -43,7 +46,7 @@ function host(sessions: Record<string, { parentID?: string; cost: number }> = {}
       get: async ({ sessionID }: { sessionID: string }) => {
         const session = sessions[sessionID]
         if (!session) throw new Error(`Session not found: ${sessionID}`)
-        return { id: sessionID, ...session }
+        return { id: sessionID, ...session, tokens: tokenUsage(session.tokens) }
       },
       interrupt: async ({ sessionID }: { sessionID: string }) => {
         if (failing.has(sessionID)) throw new Error(`Interrupt failed: ${sessionID}`)
@@ -91,9 +94,10 @@ function host(sessions: Record<string, { parentID?: string; cost: number }> = {}
       sessions[sessionID] = { parentID, cost: 0 }
       return emit("session.created", { sessionID, parentID })
     },
-    usage: (sessionID: string, cost: number) => {
+    usage: (sessionID: string, cost: number, tokens = 0) => {
       sessions[sessionID]!.cost = cost
-      return emit("session.usage.updated", { sessionID, cost })
+      sessions[sessionID]!.tokens = tokens
+      return emit("session.usage.updated", { sessionID, cost, tokens: tokenUsage(tokens) })
     },
     started: (sessionID: string) => emit("session.execution.started", { sessionID }),
     budget: (sessionID: string, text = "") => {
@@ -106,6 +110,9 @@ function host(sessions: Record<string, { parentID?: string; cost: number }> = {}
     },
   }
 }
+
+/** OpenCode's token breakdown, with the count split so every kind is summed. */
+const tokenUsage = (count = 0) => ({ input: count / 2, output: count / 4, reasoning: 0, cache: { read: count / 4, write: 0 } })
 
 const cleanups: (() => unknown)[] = []
 afterEach(() => {
@@ -135,6 +142,113 @@ describe("opencode-cap", () => {
       exceeded: false,
       sessions: { root: 0.5, sub: 0.25 },
     })
+  })
+
+  test("reports total tokens alongside cost", async () => {
+    const file = join(await mkdtemp(join(tmpdir(), "cap-")), "usage.jsonl")
+    const oc = host()
+    await oc.load({ tokenLimit: 10000, report: file })
+    await oc.created("root")
+    await oc.created("sub", "root")
+    await oc.usage("root", 0.5, 2000)
+    await oc.usage("sub", 0.25, 1000)
+    await oc.emit("session.execution.succeeded", { sessionID: "root" })
+
+    const [line] = (await readFile(file, "utf8")).trim().split("\n").map((line) => JSON.parse(line))
+    expect(line).toMatchObject({ cost: 0.75, tokens: 3000, limit: null, tokenLimit: 10000, exceeded: false })
+  })
+
+  test("stops the whole session tree once combined tokens exceed the token limit", async () => {
+    const oc = host()
+    await oc.load({ tokenLimit: 1000, warn: false })
+    await oc.created("root")
+    await oc.created("sub", "root")
+
+    await oc.usage("root", 0, 600)
+    await oc.usage("sub", 0, 400)
+    expect(oc.interrupted).toEqual([])
+
+    await oc.usage("sub", 0, 500)
+    expect(oc.interrupted.sort()).toEqual(["root", "sub"])
+    expect(oc.notes.at(-1)!.text).toBe(
+      "Budget exceeded: this session and its 1 subagent spent 1,100 tokens, over the 1,000 token limit, " +
+        "so opencode-cap stopped it. Run /budget tokens <amount> to raise this session's limit.",
+    )
+
+    await oc.started("root")
+    expect(oc.interrupted.filter((id) => id === "root")).toHaveLength(2)
+  })
+
+  test("names every limit that is exceeded", async () => {
+    const oc = host()
+    await oc.load({ limit: 1, tokenLimit: 1000, warn: false })
+    await oc.created("root")
+    await oc.usage("root", 2, 2000)
+    expect(oc.notes.at(-1)!.text).toBe(
+      "Budget exceeded: this session spent $2.00 and 2,000 tokens, over the $1.00 limit and the 1,000 token limit, " +
+        "so opencode-cap stopped it. Run /budget <amount> or /budget tokens <amount> to raise this session's limit.",
+    )
+  })
+
+  test("warns separately for cost and tokens", async () => {
+    const oc = host()
+    await oc.load({ limit: 1, tokenLimit: 1000, warn: 0.5 })
+    await oc.created("root")
+    await oc.usage("root", 0.6, 100)
+    await oc.usage("root", 0.7, 600)
+    await oc.usage("root", 0.8, 700)
+
+    expect(oc.notes.map((note) => note.text)).toEqual([
+      "Budget warning: this session spent $0.60 of its $1.00 limit. Wrap up soon; work stops when the limit is exceeded.",
+      "Budget warning: this session spent 600 tokens of its 1,000 token limit. Wrap up soon; work stops when the limit is exceeded.",
+    ])
+    expect(oc.interrupted).toEqual([])
+  })
+
+  test("/budget tokens raises a session's token limit so work can continue", async () => {
+    const oc = host()
+    await oc.load({ limit: 10, tokenLimit: 1000, warn: false })
+    await oc.created("root")
+    await oc.usage("root", 1, 1500)
+    oc.interrupted.length = 0
+
+    await oc.budget("root", "tokens 5,000")
+    expect(oc.storage.get("tokenLimit/root")).toBe(5000)
+    expect(oc.notes.at(-1)!.text).toBe(
+      "Budget: this session spent $1.00 of its $10.00 limit (10%) and 1,500 tokens of its 5,000 token limit (30%).",
+    )
+
+    await oc.started("root")
+    expect(oc.interrupted).toEqual([])
+
+    await oc.budget("root", "tokens")
+    expect(oc.notes.at(-1)!.text).toStartWith("Usage: /budget")
+  })
+
+  test("shows tokens in /budget when only a token limit is set", async () => {
+    const oc = host()
+    await oc.load({ tokenLimit: 1000 })
+    await oc.created("root")
+    await oc.usage("root", 0.25, 250)
+    await oc.budget("root")
+    expect(oc.notes.at(-1)!.text).toBe("Budget: this session spent $0.25 and 250 tokens of its 1,000 token limit (25%).")
+  })
+
+  test("restores token limits and subagent tokens after a restart", async () => {
+    const before = host()
+    await before.load({})
+    await before.created("root")
+    await before.created("sub", "root")
+    await before.usage("sub", 0, 800)
+    await before.budget("root", "tokens 1000")
+    await before.emit("session.deleted", { sessionID: "sub" })
+
+    // Entries stored before token tracking have no tokens and still load.
+    before.storage.set("tree/root", { ...(before.storage.get("tree/root") as object), old: { parentID: "root", cost: 0 } })
+    const after = host({ root: { cost: 0 } }, before.storage)
+    await after.load({ warn: false })
+    await after.usage("root", 0, 300)
+    expect(after.interrupted.sort()).toEqual(["old", "root", "sub"])
   })
 
   test("stops the whole session tree once combined spend exceeds the limit", async () => {
@@ -235,8 +349,8 @@ describe("opencode-cap", () => {
     await before.created("nested", "sub")
     await before.budget("root", "3")
     expect(before.storage.get("tree/root")).toEqual({
-      sub: { parentID: "root", cost: 0 },
-      nested: { parentID: "sub", cost: 0 },
+      sub: { parentID: "root", cost: 0, tokens: 0 },
+      nested: { parentID: "sub", cost: 0, tokens: 0 },
     })
 
     const sessions = { root: { cost: 1 }, sub: { parentID: "root", cost: 1 }, nested: { parentID: "sub", cost: 0.5 } }
@@ -254,7 +368,7 @@ describe("opencode-cap", () => {
     await oc.load({ limit: 1, warn: false })
     await oc.usage("sub", 0.7)
     expect(oc.interrupted.sort()).toEqual(["root", "sub"])
-    expect(oc.storage.get("tree/root")).toEqual({ sub: { parentID: "root", cost: 0.7 } })
+    expect(oc.storage.get("tree/root")).toEqual({ sub: { parentID: "root", cost: 0.7, tokens: 0 } })
   })
 
   test("forgets a root session and its stored state when it is deleted", async () => {
@@ -263,6 +377,7 @@ describe("opencode-cap", () => {
     await oc.created("root")
     await oc.created("sub", "root")
     await oc.budget("root", "2")
+    await oc.budget("root", "tokens 1000")
     await oc.emit("session.deleted", { sessionID: "root" })
     expect([...oc.storage.keys()]).toEqual([])
   })

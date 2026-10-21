@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { parseAmount, parseOptions } from "../src/options"
+import { parseAmount, parseOptions, parseTokens } from "../src/options"
 
 test("defaults to tracking only, warning at 80%", () => {
   expect(parseOptions({})).toEqual({ limit: undefined, warn: 0.8 })
@@ -8,6 +8,15 @@ test("defaults to tracking only, warning at 80%", () => {
 test("accepts a limit and warning fraction", () => {
   expect(parseOptions({ limit: 5, warn: 0.5 })).toEqual({ limit: 5, warn: 0.5 })
   expect(parseOptions({ limit: 5, warn: false })).toEqual({ limit: 5, warn: false })
+})
+
+test("accepts a token limit", () => {
+  expect(parseOptions({ tokenLimit: 500000 })).toEqual({ tokenLimit: 500000, warn: 0.8 })
+  expect(parseOptions({ tokenLimit: "500000" })).toEqual({ tokenLimit: 500000, warn: 0.8 })
+  expect(parseOptions({ tokenLimit: "" })).toEqual({ tokenLimit: undefined, warn: 0.8 })
+  expect(() => parseOptions({ tokenLimit: 0 })).toThrow(/tokenLimit/)
+  expect(() => parseOptions({ tokenLimit: 1.5 })).toThrow(/tokenLimit/)
+  expect(() => parseOptions({ tokenLimit: "lots" })).toThrow(/tokenLimit/)
 })
 
 test("accepts values substituted from environment variables", () => {
@@ -31,4 +40,12 @@ test("parses /budget amounts", () => {
   expect(parseAmount("")).toBeUndefined()
   expect(parseAmount("ten")).toBeUndefined()
   expect(parseAmount("-1")).toBeUndefined()
+})
+
+test("parses /budget tokens amounts", () => {
+  expect(parseTokens("500000")).toBe(500000)
+  expect(parseTokens(" 1,000,000 ")).toBe(1000000)
+  expect(parseTokens("")).toBeUndefined()
+  expect(parseTokens("1.5")).toBeUndefined()
+  expect(parseTokens("-1")).toBeUndefined()
 })
